@@ -111,21 +111,37 @@ class EmailFilter:
             self.logger.debug(f"Excluded sender: {sender}")
             return False
             
-        # Strong exclusion for financial content
-        financial_terms = ['stock', 'shares', 'earnings', 'etf', 'investment', 'financial', 'trading', 'nasdaq', 'nyse', 'market cap']
-        if any(term in subject or term in body for term in financial_terms):
-            # Allow only if it's explicitly AI-related financial news
-            ai_financial_terms = ['ai stock', 'artificial intelligence investment', 'machine learning company']
-            if not any(term in subject or term in body for term in ai_financial_terms):
-                self.logger.debug(f"Excluded financial content: {subject}")
+        # Strong exclusion for non-AI content
+        exclusion_terms = [
+            # Financial (unless AI-related)
+            'stock', 'shares', 'etf', 'investment', 'trading', 'nasdaq', 'nyse', 'market cap',
+            # News categories
+            'politics', 'election', 'climate', 'weather', 'sports', 'entertainment', 'celebrity',
+            'food', 'recipe', 'milk', 'pecan', 'cooking', 'restaurant', 'cuisine',
+            # General news
+            'war', 'crisis', 'breaking news', 'conspiracy theory', 'cia', 'oswald', 'kennedy',
+            'obesity', 'health', 'medical', 'hospital', 'quality of life', 'tourism',
+            # More specific exclusions
+            'kenya', 'russia', 'north korea', 'storms', 'flooding', 'subway', 'highways',
+            'epstein', 'cuomo', 'netanyahu', 'nukes', 'nuclear', 'vitamin d tracker'
+        ]
+        
+        if any(term in subject or term in body for term in exclusion_terms):
+            # Allow only if it's explicitly AI-related
+            ai_integration_terms = [
+                'ai', 'artificial intelligence', 'machine learning', 'neural network', 
+                'deep learning', 'openai', 'chatgpt', 'claude', 'gpt', 'llm'
+            ]
+            if not any(ai_term in subject or ai_term in body for ai_term in ai_integration_terms):
+                self.logger.debug(f"Excluded non-AI content: {subject}")
                 return False
         
         # Calculate AI relevance score
         ai_score = self._calculate_ai_relevance(subject, body, sender)
         
-        # Lower threshold for premium sources
+        # Higher threshold to ensure AI relevance
         is_premium = self._is_premium_source(sender)
-        threshold = 1 if is_premium else 2
+        threshold = 3 if is_premium else 4
         is_valid = ai_score >= threshold
         
         self.logger.debug(f"Email '{subject}' from {'premium' if is_premium else 'regular'} source - AI score: {ai_score} -> Valid: {is_valid}")
@@ -232,11 +248,7 @@ class GmailService:
             all_labels = [lbl['name'] for lbl in labels_res.get('labels', [])]
             self.logger.info(f"Available Gmail labels: {', '.join(all_labels[:10])}...")  # Show first 10
             
-            label_id = next(
-                (lbl['id'] for lbl in labels_res.get('labels', [])
-                 if lbl['name'].lower() == self.config.gmail_label.lower()),
-                None
-            )
+            label_id = self._find_label_flexible(labels_res.get('labels', []), self.config.gmail_label)
             if not label_id:
                 self.logger.warning(f"Label '{self.config.gmail_label}' not found. Available labels: {all_labels}")
                 return items
@@ -391,6 +403,37 @@ class GmailService:
                 unique_newsletters.append(newsletter)
         
         return unique_newsletters
+
+    def _normalize_label_name(self, label_name: str) -> str:
+        """Normalize label name for flexible matching"""
+        return label_name.lower().replace(' ', '').replace('-', '').replace('_', '')
+
+    def _find_label_flexible(self, labels: List[Dict], target_label: str) -> str:
+        """Find Gmail label with flexible matching for spaces, hyphens, and case"""
+        if not labels or not target_label:
+            return None
+        
+        target_normalized = self._normalize_label_name(target_label)
+        
+        # First try exact match (case-insensitive)
+        for label in labels:
+            if label['name'].lower() == target_label.lower():
+                return label['id']
+        
+        # Then try normalized matching (remove spaces, hyphens, underscores)
+        for label in labels:
+            if self._normalize_label_name(label['name']) == target_normalized:
+                self.logger.info(f"Found label '{label['name']}' matching '{target_label}' (flexible match)")
+                return label['id']
+        
+        # Finally try partial matching
+        for label in labels:
+            if target_normalized in self._normalize_label_name(label['name']) or \
+               self._normalize_label_name(label['name']) in target_normalized:
+                self.logger.info(f"Found label '{label['name']}' partially matching '{target_label}'")
+                return label['id']
+        
+        return None
 
 
 
@@ -645,22 +688,27 @@ AI News Today:
 
     def categorize_newsletters(self,newsletters:List[Dict])->Dict:
         if not newsletters: return {}
+        
+        # Temporarily force fallback categorization for testing
+        self.logger.info("🔄 Using improved keyword-based categorization...")
+        return self._create_fallback_categories(newsletters)
+        
         content="\n".join(f"Newsletter: {nl['subject']} (Source: {nl['sender']})\nContent: {nl['body']}" for nl in newsletters)
         prompt=f"""
-You are an AI news analyst. Organize ONLY AI-related content into categories.
+You are an AI news analyst. Categorize ONLY AI-related content. Distribute items across multiple categories.
 
-STRICT REQUIREMENTS:
-1. EXCLUDE all content about stocks, earnings, ETFs, investments, trading, market performance, financial reports
-2. EXCLUDE travel, entertainment, oil, general business news unless directly AI-related
-3. ONLY include content about artificial intelligence, machine learning, AI tools, AI research, AI policy, AI ethics
+SPECIFIC CATEGORIZATION RULES:
+- AI Regulation & Policy: Government contracts, defense contracts, EU policies, regulations, compliance
+- AI Tools & Products: Product launches, new AI tools, platform releases, consumer applications  
+- AI Research & Development: Academic research, technical papers, breakthrough studies, open source
+- AI Business & Industry: Company acquisitions, hiring, funding, partnerships, earnings of AI companies
+- AI Ethics & Safety: Safety concerns, bias issues, responsible AI, threat detection
 
-Categories to use:
-- AI Regulation & Policy
-- AI Tools & Products  
-- AI Research & Development
-- AI Business & Industry (only AI companies/AI business news)
-- AI Ethics & Safety
-- Other AI News
+IMPORTANT: 
+- Distribute items across ALL relevant categories
+- Do NOT put everything in "Other AI News"
+- Each item should go in the MOST SPECIFIC category
+- If unsure, use broader categories like "AI Business & Industry"
 
 Return VALID JSON with category names as keys and arrays of item descriptions as values.
 Format each item as: "Item description (Source: Source Name)"
@@ -672,13 +720,15 @@ Content to analyze:
             resp = self.client.chat.completions.create(
                 model=self.config.openai_model,
                 messages=[
-                    {"role": "system", "content": "You are an AI news analyst. Always return valid JSON."},
+                    {"role": "system", "content": "You are an AI news analyst. Always return valid JSON. NEVER use markdown formatting. Return only the JSON object."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.2,
-                max_tokens=1500
+                temperature=0.1,
+                max_tokens=2000
             )
             text = resp.choices[0].message.content.strip()
+            self.logger.info(f"🤖 LLM categorization response length: {len(text)} chars")
+            self.logger.debug(f"🤖 LLM response preview: {text[:200]}...")
             
             # Clean up the response to ensure valid JSON
             if text.startswith('```json'):
@@ -691,17 +741,69 @@ Content to analyze:
                 result = json.loads(text)
                 # Validate the result structure
                 if isinstance(result, dict):
+                    self.logger.info(f"✅ LLM categorization successful: {len(result)} categories")
                     return result
                 else:
                     self.logger.warning("LLM returned non-dict result, using fallback")
                     return self._parse_fallback_response(text)
             except json.JSONDecodeError as e:
-                self.logger.warning(f"JSON parsing failed: {e}, using fallback")
+                self.logger.warning(f"JSON parsing failed: {e}")
+                self.logger.debug(f"Failed JSON text: {text[:500]}...")
                 return self._parse_fallback_response(text)
                 
         except Exception as e:
-            self.logger.error(f"LLM error: {e}")
-            return {}
+            self.logger.error(f"LLM categorization error: {e}")
+            self.logger.info("🔄 Using fallback categorization...")
+            return self._create_fallback_categories(newsletters)
+    
+    def _create_fallback_categories(self, newsletters: List[Dict]) -> Dict[str, List[str]]:
+        """Create fallback categories when LLM fails"""
+        categories = {
+            "AI Fraud & Scams": [],
+            "AI Regulation & Policy": [],
+            "AI Tools & Products": [],
+            "AI Research & Development": [],
+            "AI Business & Industry": [],
+            "AI Ethics & Safety": [],
+            "Other AI News": []
+        }
+        
+        for nl in newsletters:
+            # Create clickable link if URL is available
+            url = self._extract_url_from_body(nl.get('body', ''))
+            if url:
+                item_text = f"<a href=\"{url}\" target=\"_blank\">{nl['subject']}</a> (Source: {nl['sender']})"
+            else:
+                item_text = f"{nl['subject']} (Source: {nl['sender']})"
+            subject_lower = nl['subject'].lower()
+            
+            # PRIORITY: Fraud detection (highest priority)
+            fraud_terms = ['fraud', 'scam', 'deepfake', 'deepfakes', 'voice cloning', 'fake', 'synthetic media', 
+                          'identity theft', 'impersonation', 'misinformation', 'disinformation', 'catfish', 
+                          'phishing', 'criminal', 'deceptive', 'manipulation']
+            if any(term in subject_lower for term in fraud_terms):
+                categories["AI Fraud & Scams"].append(item_text)
+            
+            # Other categorization rules
+            elif any(term in subject_lower for term in ['government', 'defense', 'contract', 'policy', 'regulation', 'eu', 'law']):
+                categories["AI Regulation & Policy"].append(item_text)
+            elif any(term in subject_lower for term in ['acquisition', 'acquires', 'funding', 'partnership', 'earnings', 'stock', 'investment', 'company']):
+                categories["AI Business & Industry"].append(item_text)
+            elif any(term in subject_lower for term in ['product', 'launch', 'tool', 'platform', 'app', 'software', 'copilot', 'grok', 'chatgpt']):
+                categories["AI Tools & Products"].append(item_text)
+            elif any(term in subject_lower for term in ['research', 'study', 'paper', 'academic', 'breakthrough', 'model', 'llm']):
+                categories["AI Research & Development"].append(item_text)
+            elif any(term in subject_lower for term in ['safety', 'ethics', 'bias', 'danger', 'threat', 'risk']):
+                categories["AI Ethics & Safety"].append(item_text)
+            else:
+                categories["Other AI News"].append(item_text)
+        
+        # Remove empty categories
+        categories = {k: v for k, v in categories.items() if v}
+        
+        total_items = sum(len(items) for items in categories.values())
+        self.logger.info(f"📂 Fallback categorization: {total_items} items across {len(categories)} categories")
+        return categories
     def _parse_fallback_response(self,text:str)->Dict[str,List[str]]:
         cats={};curr=None
         for line in text.splitlines():
@@ -711,7 +813,137 @@ Content to analyze:
                 curr=l.rstrip(':');cats[curr]=[]
             elif curr: cats[curr].append(l.lstrip('-• '))
         return cats
-    def format_report(self, newsletters: List[Dict], categories: Dict, summary: str = None) -> str:
+
+    def assess_risk_levels(self, newsletters: List[Dict]) -> Dict[str, str]:
+        """Assess risk levels for newsletter items"""
+        if not newsletters:
+            return {}
+        
+        # Prepare content for risk assessment
+        content_for_risk = []
+        for nl in newsletters:
+            content_for_risk.append(f"Item: {nl['subject']}\nSource: {nl['sender']}\nContent: {nl['body'][:300]}")
+        
+        content_text = "\n\n---\n\n".join(content_for_risk)
+        
+        risk_prompt = f"""
+Assess the security and threat risk level for each AI news item. Focus on immediate threat potential and security implications for organizations and individuals.
+
+RISK LEVELS AND THREAT CATEGORIES:
+
+HIGH RISK 🔴 (Immediate Security Threats):
+- Fraud & Scams: Deepfakes, voice cloning, AI-generated fraud, identity theft, investment scams
+- Active Threats: AI-powered attacks, security breaches, malware, phishing campaigns
+- Weaponization: AI used for misinformation, election interference, propaganda, social engineering
+- Criminal Exploitation: AI tools being used for illegal activities, criminal operations
+- Critical Vulnerabilities: Security flaws in AI systems, data breaches, system compromises
+
+MEDIUM RISK 🟡 (Business & Strategic Impact):
+- Corporate Events: M&A, partnerships, major funding, strategic alliances, leadership changes
+- Regulatory Changes: Policy updates, compliance requirements, government regulations
+- Competitive Intelligence: Market disruptions, industry shifts, competitive developments
+- Government Contracts: Defense deals, public sector AI adoption, policy implementations
+- Infrastructure Changes: Major platform updates, system deployments, technology shifts
+
+LOW RISK 🟢 (Operational & Educational):
+- Technical Improvements: Feature updates, performance enhancements, bug fixes, optimizations
+- Education & Training: Tutorials, courses, documentation, best practices, skill development
+- Research & Academia: Papers, studies, theoretical work, academic discussions
+- General Content: News commentary, opinion pieces, industry analysis, trend discussions
+- Product Announcements: Minor releases, beta features, tool launches without security implications
+
+Prioritize security threats over business impact. Consider the immediate actionable threat to users and organizations.
+
+Return VALID JSON mapping item titles to risk levels:
+{{"Item Title 1": "HIGH", "Item Title 2": "MEDIUM", "Item Title 3": "LOW"}}
+
+Content to assess:
+{content_text}
+"""
+        
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.config.openai_model,
+                messages=[
+                    {"role": "system", "content": "You are a cybersecurity and AI safety analyst specializing in threat assessment and security risk evaluation. Focus on identifying security threats, fraud, and malicious AI use. Always return valid JSON."},
+                    {"role": "user", "content": risk_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=1000
+            )
+            
+            text = resp.choices[0].message.content.strip()
+            
+            # Clean up the response
+            if text.startswith('```json'):
+                text = text[7:]
+            if text.endswith('```'):
+                text = text[:-3]
+            text = text.strip()
+            
+            try:
+                risk_levels = json.loads(text)
+                if isinstance(risk_levels, dict):
+                    return risk_levels
+                else:
+                    self.logger.warning("Risk assessment returned non-dict, using fallback")
+                    return self._fallback_risk_assessment(newsletters)
+            except json.JSONDecodeError:
+                self.logger.warning("Risk assessment JSON parsing failed, using fallback")
+                return self._fallback_risk_assessment(newsletters)
+                
+        except Exception as e:
+            self.logger.error(f"Risk assessment error: {e}")
+            return self._fallback_risk_assessment(newsletters)
+    
+    def _fallback_risk_assessment(self, newsletters: List[Dict]) -> Dict[str, str]:
+        """Fallback risk assessment based on keywords"""
+        risk_levels = {}
+        
+        high_risk_keywords = [
+            # Security threats and fraud
+            'fraud', 'scam', 'deepfake', 'deepfakes', 'voice cloning', 'synthetic media', 'fake', 'cloned',
+            'identity theft', 'impersonation', 'misinformation', 'disinformation', 'manipulation',
+            'attack', 'breach', 'hack', 'threat', 'malicious', 'criminal', 'exploitation',
+            'security warning', 'alert', 'vulnerable', 'compromised', 'malware', 'phishing',
+            'election interference', 'propaganda', 'ai-powered attack'
+        ]
+        medium_risk_keywords = [
+            # Business and industry impact
+            'acquisition', 'merger', 'partnership', 'funding', 'investment', 'ipo', 'contract',
+            'regulation', 'policy', 'compliance', 'government', 'defense', 'military',
+            'competition', 'market', 'industry', 'disruption', 'strategic', 'deal',
+            'hired', 'poached', 'acquires', 'buys', 'earnings', 'revenue'
+        ]
+        
+        for nl in newsletters:
+            text = f"{nl['subject']} {nl['body']}".lower()
+            
+            # PRIORITY: AI Fraud & Scams - Always HIGH risk
+            fraud_indicators = [
+                'deepfake', 'deepfakes', 'voice cloning', 'voice clone', 'fraud', 'scam', 'fraudulent',
+                'fake news', 'synthetic media', 'identity theft', 'impersonation', 'catfish',
+                'misinformation', 'disinformation', 'manipulation', 'deceptive', 'criminal',
+                'phishing', 'social engineering', 'investment scam', 'ponzi', 'pyramid scheme',
+                'romance scam', 'ai-generated lies', 'fake identity', 'synthetic voice'
+            ]
+            
+            if any(indicator in text for indicator in fraud_indicators):
+                risk_levels[nl['subject']] = "HIGH"
+            
+            # Other high-risk security patterns
+            elif any(phrase in text for phrase in ['ai attack', 'security breach', 'hack', 'malware', 'vulnerable', 'compromised']):
+                risk_levels[nl['subject']] = "HIGH"
+            elif any(keyword in text for keyword in high_risk_keywords):
+                risk_levels[nl['subject']] = "HIGH"
+            elif any(keyword in text for keyword in medium_risk_keywords):
+                risk_levels[nl['subject']] = "MEDIUM"
+            else:
+                risk_levels[nl['subject']] = "LOW"
+        
+        return risk_levels
+
+    def format_report(self, newsletters: List[Dict], categories: Dict, summary: str = None, risk_levels: Dict[str, str] = None) -> str:
         date_str = datetime.now().strftime('%Y-%m-%d')
         total_items = sum(len(items) for items in categories.values()) if categories else 0
         
@@ -732,10 +964,15 @@ Content to analyze:
         .category ul {{ margin: 0; padding-left: 20px; }}
         .category li {{ margin: 8px 0; }}
         .category a {{ color: #667eea; text-decoration: none; font-weight: 500; }}
-        .category a:hover {{ text-decoration: underline; }}
+        .category a:hover {{ text-decoration: underline; color: #5a6cf8; }}
+        .category a:visited {{ color: #8e9cfc; }}
         .footer {{ text-align: center; margin-top: 40px; padding: 20px; color: #666; font-size: 14px; border-top: 1px solid #eee; }}
         .summary {{ background: #e8f5e8; border-left: 4px solid #28a745; padding: 20px; margin: 20px 0; border-radius: 8px; }}
         .summary h2 {{ color: #28a745; margin-top: 0; }}
+        .risk-indicator {{ font-weight: bold; padding: 2px 6px; border-radius: 3px; margin-left: 8px; }}
+        .risk-high {{ background: #ffebee; color: #c62828; }}
+        .risk-medium {{ background: #fff3e0; color: #ef6c00; }}
+        .risk-low {{ background: #e8f5e8; color: #2e7d32; }}
     </style>
 </head>
 <body>
@@ -765,8 +1002,10 @@ Content to analyze:
         <ul>
 """
                     for item in items:
-                        formatted_item = self._convert_urls_to_links(item.strip())
-                        html += f"            <li>{formatted_item}</li>\n"
+                        # Item already contains HTML links from fallback categorization
+                        # Add risk indicator if available
+                        risk_indicator = self._get_risk_indicator(item, risk_levels)
+                        html += f"            <li>{item.strip()}{risk_indicator}</li>\n"
                     html += """        </ul>
     </div>"""
         
@@ -781,6 +1020,48 @@ Content to analyze:
     def _convert_urls_to_links(self,text:str)->str:
         m=re.match(r"(.+?)\s*\((https?://[^\s\)]+)\)",text)
         return f"{m.group(1)} <a href=\"{m.group(2)}\">[Link]</a>" if m else text
+    
+    def _get_risk_indicator(self, item: str, risk_levels: Dict[str, str]) -> str:
+        """Get risk indicator HTML for an item"""
+        if not risk_levels:
+            return ""
+        
+        # Extract the item title (before " (Source:")
+        item_title = item.split(" (Source:")[0].strip()
+        # Remove HTML tags if present
+        item_title = re.sub(r'<[^>]+>', '', item_title)
+        
+        # Find matching risk level
+        risk_level = None
+        for title, level in risk_levels.items():
+            if title.lower() in item_title.lower() or item_title.lower() in title.lower():
+                risk_level = level
+                break
+        
+        if not risk_level:
+            risk_level = "LOW"  # Default to LOW if not found
+        
+        risk_class = f"risk-{risk_level.lower()}"
+        return f' <span class="risk-indicator {risk_class}">({risk_level})</span>'
+    
+    def _extract_url_from_body(self, body: str) -> str:
+        """Extract URL from email body"""
+        if not body:
+            return ""
+        
+        # Look for URLs in the body text
+        url_patterns = [
+            r'https?://[^\s\)]+',  # Basic URL pattern
+            r'\(https?://[^\s\)]+\)',  # URL in parentheses
+        ]
+        
+        for pattern in url_patterns:
+            match = re.search(pattern, body)
+            if match:
+                url = match.group(0).strip('()')
+                return url
+        
+        return ""
 
 def init_database(db_path:Path):
     conn=get_db_connection(db_path);cur=conn.cursor()
@@ -826,9 +1107,20 @@ def main():
         gmail_srv.send_email(html, "🤖 Daily AI Newsletter Report - No Content")
         return
     logger.info(f"Processing {len(newsletters)} items.")
+    
+    # Debug: Show sample content
+    logger.info("📋 Sample collected items:")
+    for i, nl in enumerate(newsletters[:5]):
+        logger.info(f"  {i+1}. {nl['subject'][:80]}...")
+    
     categories=llm_proc.categorize_newsletters(newsletters)
+    logger.info(f"📂 Categories returned: {list(categories.keys())}")
+    logger.info(f"📊 Total categorized items: {sum(len(items) for items in categories.values())}")
+    
     summary=llm_proc.generate_summary(newsletters)
-    report_html=llm_proc.format_report(newsletters, categories, summary)
+    risk_levels=llm_proc.assess_risk_levels(newsletters)
+    logger.info(f"📊 Risk assessment completed: {len(risk_levels)} items analyzed")
+    report_html=llm_proc.format_report(newsletters, categories, summary, risk_levels)
     subject=f"🤖 Daily AI Newsletter Report - {datetime.now().strftime('%Y-%m-%d')}"
     gmail_srv.send_email(report_html, subject)
     logger.info("✅ Report sent.")
